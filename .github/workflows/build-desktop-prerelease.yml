@@ -23,7 +23,16 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
-          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+          GIT_REF="${{ secrets.GIT_REF }}"
+          if [ -z "$GIT_REF" ]; then
+            GIT_REF="main"
+          fi
+          git clone --depth 1 --branch "$GIT_REF" "${{ secrets.GIT_ADDRESS }}" source
+          echo "Cloned source repository metadata:"
+          git -C source status --short --branch
+          git -C source log -1 --oneline || true
+          echo "Top-level source files:"
+          find source -maxdepth 2 -mindepth 1 -not -path '*/.git/*' -print | sort | head -200
 
       - name: Read build metadata
         id: meta
@@ -61,7 +70,9 @@ jobs:
         shell: pwsh
         run: |
           if ("${{ secrets.GIT_ADDRESS }}" -eq "") { throw "Missing secrets.GIT_ADDRESS" }
-          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+          $gitRef = "${{ secrets.GIT_REF }}"
+          if ($gitRef -eq "") { $gitRef = "main" }
+          git clone --depth 1 --branch $gitRef "${{ secrets.GIT_ADDRESS }}" source
 
       - name: Resolve source directory
         id: src
@@ -114,7 +125,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
-          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+          GIT_REF="${{ secrets.GIT_REF }}"
+          if [ -z "$GIT_REF" ]; then
+            GIT_REF="main"
+          fi
+          git clone --depth 1 --branch "$GIT_REF" "${{ secrets.GIT_ADDRESS }}" source
 
       - name: Resolve source directory
         id: src
