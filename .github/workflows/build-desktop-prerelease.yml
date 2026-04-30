@@ -1,0 +1,215 @@
+name: Build Desktop Prerelease
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Optional release tag. Defaults to v<package-version>-pre.<run-number>.
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Clone source repository
+        shell: bash
+        run: |
+          test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
+          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+
+      - name: Read build metadata
+        id: meta
+        shell: bash
+        run: |
+          VERSION="$(node -p "require('./source/package.json').version")"
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${VERSION}-pre.${GITHUB_RUN_NUMBER}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+          echo "Tag: $TAG"
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - name: Clone source repository
+        shell: pwsh
+        run: |
+          if ("${{ secrets.GIT_ADDRESS }}" -eq "") { throw "Missing secrets.GIT_ADDRESS" }
+          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: source
+        shell: pwsh
+        run: npm install --package-lock=false
+
+      - name: Build Windows installer
+        working-directory: source
+        shell: pwsh
+        run: npm run dist:win -- --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drone-simulator-windows-${{ needs.prepare.outputs.version }}
+          path: |
+            source/release/*.exe
+            source/release/*.msi
+            source/release/*.blockmap
+          if-no-files-found: error
+
+  build-macos:
+    needs: prepare
+    runs-on: macos-latest
+    steps:
+      - name: Clone source repository
+        shell: bash
+        run: |
+          test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
+          git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        working-directory: source
+        run: npm install --package-lock=false
+
+      - name: Import Apple signing material from project
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          load_env() {
+            local file="$1"
+            if [ -f "$file" ]; then
+              set -a
+              # shellcheck disable=SC1090
+              . "$file"
+              set +a
+            fi
+          }
+
+          load_env doc/mac/electron-builder-dmg.env
+          DMG_CSC_LINK="${CSC_LINK:-./doc/mac/dev.p12}"
+          DMG_CSC_KEY_PASSWORD="${CSC_KEY_PASSWORD:-}"
+          DMG_CSC_INSTALLER_LINK="${CSC_INSTALLER_LINK:-}"
+          DMG_CSC_INSTALLER_KEY_PASSWORD="${CSC_INSTALLER_KEY_PASSWORD:-}"
+
+          load_env doc/mac/electron-builder-mas.env
+          MAS_CSC_LINK="${CSC_LINK:-./doc/mac/distribution.p12}"
+          MAS_CSC_KEY_PASSWORD="${CSC_KEY_PASSWORD:-}"
+          MAS_CSC_INSTALLER_LINK="${CSC_INSTALLER_LINK:-./doc/mac/installer.p12}"
+          MAS_CSC_INSTALLER_KEY_PASSWORD="${CSC_INSTALLER_KEY_PASSWORD:-}"
+          MAS_PROVISIONING_PROFILE="${MAS_PROVISIONING_PROFILE:-./doc/mac/distribution.provisionprofile}"
+
+          KEYCHAIN_PASSWORD="${KEYCHAIN_PASSWORD:-drone-simulator-ci-keychain}"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build-signing.keychain-db"
+
+          require_file() {
+            if [ ! -f "$1" ]; then
+              echo "Missing required signing file: $1"
+              exit 1
+            fi
+          }
+
+          require_file "$DMG_CSC_LINK"
+          require_file "$MAS_CSC_LINK"
+          require_file "$MAS_CSC_INSTALLER_LINK"
+          require_file "$MAS_PROVISIONING_PROFILE"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$DMG_CSC_LINK" -P "$DMG_CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          if [ -n "$DMG_CSC_INSTALLER_LINK" ] && [ -f "$DMG_CSC_INSTALLER_LINK" ]; then
+            security import "$DMG_CSC_INSTALLER_LINK" -P "$DMG_CSC_INSTALLER_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          fi
+
+          security import "$MAS_CSC_LINK" -P "$MAS_CSC_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security import "$MAS_CSC_INSTALLER_LINK" -P "$MAS_CSC_INSTALLER_KEY_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          cp "$MAS_PROVISIONING_PROFILE" "$HOME/Library/MobileDevice/Provisioning Profiles/distribution.provisionprofile"
+
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | sed s/\"//g)
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+
+      - name: Build macOS DMG
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f doc/mac/electron-builder-dmg.env ]; then
+            set -a
+            . doc/mac/electron-builder-dmg.env
+            set +a
+          fi
+          npm run dist:mac:dmg -- --publish never
+
+      - name: Build Mac App Store package
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f doc/mac/electron-builder-mas.env ]; then
+            set -a
+            . doc/mac/electron-builder-mas.env
+            set +a
+          fi
+          npm run dist:mac:mas -- --publish never
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: drone-simulator-macos-${{ needs.prepare.outputs.version }}
+          path: |
+            source/release/*.dmg
+            source/release/*.pkg
+            source/release/**/*.pkg
+          if-no-files-found: error
+
+  prerelease:
+    needs:
+      - prepare
+      - build-windows
+      - build-macos
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          mapfile -t files < <(find artifacts -maxdepth 3 -type f -print)
+          printf '%s\n' "${files[@]}"
+          [ "${#files[@]}" -gt 0 ] || (echo "No release assets found" && exit 1)
+          gh release delete "$RELEASE_TAG" --cleanup-tag --yes || true
+          gh release create "$RELEASE_TAG" "${files[@]}" \
+            --prerelease \
+            --title "Drone Simulator ${VERSION} prerelease" \
+            --notes "Automated prerelease build for Drone Simulator ${VERSION}. Includes Windows installer, macOS DMG, and Mac App Store package."
