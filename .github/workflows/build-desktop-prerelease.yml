@@ -21,6 +21,7 @@ jobs:
       - name: Clone source repository
         shell: bash
         run: |
+          set -euo pipefail
           test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
           git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
 
@@ -28,7 +29,21 @@ jobs:
         id: meta
         shell: bash
         run: |
-          VERSION="$(node -p "require('./source/package.json').version")"
+          set -euo pipefail
+          PACKAGE_JSON="source/package.json"
+          if [ ! -f "$PACKAGE_JSON" ]; then
+            mapfile -t packages < <(find source -maxdepth 4 -name package.json -not -path '*/node_modules/*' -print)
+            printf 'Found package.json files:\n%s\n' "${packages[@]:-none}"
+            if [ "${#packages[@]}" -eq 1 ]; then
+              PACKAGE_JSON="${packages[0]}"
+              echo "Using nested package metadata: $PACKAGE_JSON"
+            else
+              echo "Expected source/package.json, or exactly one nested package.json under source."
+              exit 1
+            fi
+          fi
+
+          VERSION="$(node -p "require('./${PACKAGE_JSON}').version")"
           TAG="${{ inputs.release_tag }}"
           if [ -z "$TAG" ]; then
             TAG="v${VERSION}-pre.${GITHUB_RUN_NUMBER}"
@@ -48,17 +63,36 @@ jobs:
           if ("${{ secrets.GIT_ADDRESS }}" -eq "") { throw "Missing secrets.GIT_ADDRESS" }
           git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
 
+      - name: Resolve source directory
+        id: src
+        shell: pwsh
+        run: |
+          $dir = "source"
+          if (-not (Test-Path "source/package.json")) {
+            $packages = @(Get-ChildItem -Path source -Filter package.json -Recurse | Where-Object {
+              $_.FullName -notmatch '[\\/]node_modules[\\/]'
+            })
+            Write-Host "Found package.json files:"
+            if ($packages.Count -eq 0) { Write-Host "none" } else { $packages.FullName | Write-Host }
+            if ($packages.Count -ne 1) {
+              throw "Expected source/package.json, or exactly one nested package.json under source."
+            }
+            $dir = (Resolve-Path -Relative $packages[0].DirectoryName) -replace '^[.][\\/]', '' -replace '\\', '/'
+            Write-Host "Using nested source directory: $dir"
+          }
+          "dir=$dir" >> $env:GITHUB_OUTPUT
+
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install dependencies
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         shell: pwsh
         run: npm install --package-lock=false
 
       - name: Build Windows installer
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         shell: pwsh
         run: npm run dist:win -- --publish never
 
@@ -66,9 +100,9 @@ jobs:
         with:
           name: drone-simulator-windows-${{ needs.prepare.outputs.version }}
           path: |
-            source/release/*.exe
-            source/release/*.msi
-            source/release/*.blockmap
+            ${{ steps.src.outputs.dir }}/release/*.exe
+            ${{ steps.src.outputs.dir }}/release/*.msi
+            ${{ steps.src.outputs.dir }}/release/*.blockmap
           if-no-files-found: error
 
   build-macos:
@@ -78,19 +112,38 @@ jobs:
       - name: Clone source repository
         shell: bash
         run: |
+          set -euo pipefail
           test -n "${{ secrets.GIT_ADDRESS }}" || (echo "Missing secrets.GIT_ADDRESS" && exit 1)
           git clone --depth 1 "${{ secrets.GIT_ADDRESS }}" source
+
+      - name: Resolve source directory
+        id: src
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="source"
+          if [ ! -f source/package.json ]; then
+            mapfile -t packages < <(find source -maxdepth 4 -name package.json -not -path '*/node_modules/*' -print)
+            printf 'Found package.json files:\n%s\n' "${packages[@]:-none}"
+            if [ "${#packages[@]}" -ne 1 ]; then
+              echo "Expected source/package.json, or exactly one nested package.json under source."
+              exit 1
+            fi
+            dir="$(dirname "${packages[0]}")"
+            echo "Using nested source directory: $dir"
+          fi
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install dependencies
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         run: npm install --package-lock=false
 
       - name: Import Apple signing material from project
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -154,7 +207,7 @@ jobs:
           echo "CSC_KEYCHAIN=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
 
       - name: Build macOS DMG
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -166,7 +219,7 @@ jobs:
           npm run dist:mac:dmg -- --publish never
 
       - name: Build Mac App Store package
-        working-directory: source
+        working-directory: ${{ steps.src.outputs.dir }}
         shell: bash
         run: |
           set -euo pipefail
@@ -181,9 +234,9 @@ jobs:
         with:
           name: drone-simulator-macos-${{ needs.prepare.outputs.version }}
           path: |
-            source/release/*.dmg
-            source/release/*.pkg
-            source/release/**/*.pkg
+            ${{ steps.src.outputs.dir }}/release/*.dmg
+            ${{ steps.src.outputs.dir }}/release/*.pkg
+            ${{ steps.src.outputs.dir }}/release/**/*.pkg
           if-no-files-found: error
 
   prerelease:
