@@ -276,8 +276,9 @@ jobs:
           mapfile -t files < <(find artifacts -maxdepth 3 -type f -print)
           printf '%s\n' "${files[@]}"
           [ "${#files[@]}" -gt 0 ] || (echo "No release assets found" && exit 1)
-          gh release delete "$RELEASE_TAG" --cleanup-tag --yes || true
+          gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
           gh release create "$RELEASE_TAG" "${files[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
             --prerelease \
             --title "Drone Simulator ${VERSION} prerelease" \
             --notes "Automated prerelease build for Drone Simulator ${VERSION}. Includes Windows installer, macOS DMG, and Mac App Store package."
